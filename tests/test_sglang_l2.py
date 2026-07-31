@@ -171,3 +171,34 @@ def test_post_import_patcher_fires_on_first_import(tmp_path, monkeypatch):
         cache_controller = None
     assert C().write_backup(_Node(hits=0)) == 0        # patched on import
     assert p.stats.denied == 1
+
+
+# ---- logging-independent reporting -----------------------------------------
+
+def test_status_file_written_on_patch_and_readable(tmp_path):
+    import json as _json
+    from ngkv.adapters.sglang_l2 import dump_status
+    m = _module_with_cache()
+    p = L2Policy(mode="gate", min_hits=2, relax_above=0.3,
+                 status_dir=str(tmp_path), log_every=1)
+    patch_module(m, p)
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 1, "patch must write a status file"
+    doc = _json.loads(files[0].read_text())
+    assert doc["config"]["mode"] == "gate"
+    assert doc["patched"] == ["fake_hiradix.HiRadixCache"]
+
+    cache = m.HiRadixCache(avail=5, size=100)
+    cache.write_backup(_Node(hits=0))
+    cache.write_backup(_Node(hits=9))
+    doc = _json.loads(files[0].read_text())
+    assert doc["stats"]["denied"] == 1 and doc["stats"]["admitted"] == 1
+    assert doc["denial_rate"] == 0.5
+
+
+def test_emit_reaches_stderr_even_when_logging_disabled(capsys):
+    import logging as _l
+    from ngkv.adapters.sglang_l2 import _emit, logger as _lg
+    _lg.disabled = True                       # simulate dictConfig teardown
+    _emit("canary message", _l.ERROR)
+    assert "canary message" in capsys.readouterr().err
