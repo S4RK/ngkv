@@ -164,3 +164,69 @@ written to be shared, so this seam is admit/deny only, by design (see
 the boundary rule in `ngkv/adapters/sglang_backend.py`). The
 attention-informed `table` scorer needs a request-path score feed;
 wire that only after the position-scorer frontier proves the seam.
+
+---
+# Addendum: L2 (host-memory) gating — the K3 path
+
+Why: the L3 storage path in current hybrid (KDA) SGLang builds does not
+complete a round trip on Kimi K3 — verified with the plain `file` backend
+and NO NG-KV in the stack (warmup hangs to the 600s timeout either way).
+L2 is unaffected, is a harder budget (`--hicache-ratio` x device pool), sees
+*every* page under write_through, and denial there also saves the D2H copy.
+
+Seam: `HiRadixCache.write_backup(node, write_back=False) -> int`, where 0
+already means "not backed up" and every caller handles it (it is returned
+today when the parent isn't backed up, or when host alloc fails). Denial
+therefore lives inside the existing contract; worst case is a recompute.
+
+Install: no SGLang patch, no launch-command change. The repo is already on
+`PYTHONPATH`, and `sitecustomize.py` arms the gate when `NGKV_L2` is set.
+
+## Phase L2-1 — baseline
+Remove all four `--hicache-storage-backend*` / `--hicache-ratio` /
+`--hicache-write-policy` flags (back to your known-good L2-only config).
+Leave `--enable-hierarchical-cache`. Record TTFT p50/p99, throughput,
+cache hit rate under the canary mix.
+
+## Phase L2-2 — observe (zero behaviour change)
+Add ONE env var to both cliques:
+
+```yaml
+  - name: NGKV_L2
+    value: '{"mode":"observe","min_hits":2,"relax_above":0.3,"log_every":200}'
+```
+
+Boot check (both pods): a WARNING line
+`ngkv-l2 ACTIVE (mode=observe, ...) on: sglang.srt.mem_cache.hiradix_cache.HiRadixCache`
+Then under load: `ngkv-l2 [observe]: N admitted / M denied ...` — M is the
+counterfactual denial count. Metrics must match Phase L2-1 within noise;
+`observe` never denies.
+
+## Phase L2-3 — gate
+Flip `"mode":"gate"`. Sweep `min_hits` ∈ {2,3,4} and `relax_above` ∈
+{0.3, 0.5}. Per run record: denial rate + denied tokens (from the log),
+host-pool occupancy, hit rate, TTFT p50/p99, throughput.
+
+Expected shape: under low host pressure the gate relaxes and metrics are
+identical to baseline; under pressure it declines to back up
+never-reused nodes, so host pool churn and D2H traffic fall with little
+hit-rate loss. A TTFT p99 rise means denied nodes were being reused —
+lower `min_hits` or raise `relax_above`.
+
+Note the inherited prefix invariant: backed-up nodes form a contiguous
+prefix from the root, so denying a node also denies its subtree (children
+see `parent.backuped == False`). Gating is a depth cut per chain, not a
+scattered per-node choice — same shape as the L3 prefix cut.
+
+`gate_writeback` (default false) additionally gates the evict-time path,
+where denial DROPS the subtree rather than declining a backup. Leave off
+unless deliberately studying it.
+
+## Rollback
+Unset `NGKV_L2` and restart. The patch is inert without it.
+
+## Caveat, stated plainly
+This patches library internals at runtime and is version-fragile by
+construction. It refuses to patch (loud ERROR, never a silent no-op) if
+`write_backup`'s signature drifts. Re-check the ACTIVE log line on every
+SGLang upgrade.
