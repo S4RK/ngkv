@@ -154,6 +154,7 @@ def dump_status(policy: "L2Policy") -> None:
                    for f in dataclasses.fields(policy)},
         "policy_uid": policy.uid,
         "stats": dataclasses.asdict(policy.stats),
+        "probe": policy.probe,
         "denial_rate": policy.stats.denial_rate,
     }
     try:
@@ -196,6 +197,8 @@ class L2Policy:
         self.stats = L2Stats()
         self._decisions = 0
         self._warned_pressure = False
+        self._probed = False
+        self.probe: dict = {}
 
     # -- host-memory pressure -------------------------------------------
     def free_fraction(self, cache: Any) -> Optional[float]:
@@ -212,8 +215,48 @@ class L2Policy:
             return None
         return float(avail) / float(total)
 
+    # -- one-shot introspection of the real node/controller types --------
+    def _probe(self, cache: Any, node: Any) -> None:
+        """Verify the necessity signal exists in THIS build.
+
+        The radix-cache class varies by model (HiRadixCache /
+        HiMambaRadixCache / UnifiedRadixCache) and so does its node type.
+        ``hit_count`` is the necessity signal; if it is absent, getattr
+        would silently yield 0 forever and "gate" would degrade into
+        "deny everything under pressure" — a policy nobody chose. Detect
+        that and fall back to observe rather than enforce a fiction.
+        """
+        self._probed = True
+        attrs = {a: type(getattr(node, a, None)).__name__
+                 for a in ("hit_count", "key", "value", "host_value",
+                           "backuped", "lock_ref")
+                 if hasattr(node, a)}
+        self.probe = {
+            "node_type": type(node).__name__,
+            "cache_type": type(cache).__name__,
+            "node_attrs_present": sorted(attrs),
+            "node_attrs_missing": sorted(
+                a for a in ("hit_count", "key") if not hasattr(node, a)),
+            "pressure_readable": self.free_fraction(cache) is not None,
+        }
+        _emit(f"probe: node={self.probe['node_type']} "
+              f"cache={self.probe['cache_type']} "
+              f"present={self.probe['node_attrs_present']} "
+              f"missing={self.probe['node_attrs_missing']} "
+              f"pressure_readable={self.probe['pressure_readable']}")
+        if not hasattr(node, "hit_count"):
+            self.probe["forced_observe"] = True
+            if self.mode == "gate":
+                self.mode = "observe"
+                _emit("no `hit_count` on this node type — the necessity "
+                      "signal does not exist in this build. FORCING "
+                      "mode=observe; gating on a constant would mean "
+                      "denying everything under pressure.", logging.ERROR)
+
     # -- the decision ----------------------------------------------------
     def admit(self, cache: Any, node: Any) -> bool:
+        if not self._probed:
+            self._probe(cache, node)
         free = self.free_fraction(cache)
         if free is None:
             if not self._warned_pressure:
