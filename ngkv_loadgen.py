@@ -194,13 +194,37 @@ def one_request(args, prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _STAT_KEYS = ("admitted", "denied", "admitted_tokens", "denied_tokens",
-              "relaxed")
+              "relaxed", "decisions_under_pressure", "surveyed")
+_HIST_KEYS = ("hit_count_hist", "parent_hits_hist", "depth_hist",
+              "keylen_hist")
 
 
-def read_status(dirs: list[str]) -> dict:
-    """Aggregate every per-process status file across the given dirs."""
+def clear_status(dirs: list[str]) -> int:
+    """Remove status files. Do this between phases: files persist across
+    pod restarts, so a dir accumulates dead processes from earlier
+    generations and the ABSOLUTE totals become meaningless (deltas stay
+    correct, since stale files contribute 0 to a difference)."""
+    n = 0
+    for d in dirs:
+        for name in os.listdir(d) if os.path.isdir(d) else []:
+            if name.endswith(".json"):
+                try:
+                    os.remove(os.path.join(d, name)); n += 1
+                except Exception:
+                    pass
+    return n
+
+
+def read_status(dirs: list[str], fresh_within: float | None = None) -> dict:
+    """Aggregate every per-process status file across the given dirs.
+
+    ``fresh_within``: ignore files whose ``ts`` is older than this many
+    seconds, i.e. processes that are no longer writing (dead ranks from a
+    previous pod generation).
+    """
     agg = {k: 0 for k in _STAT_KEYS}
-    procs, modes, probes = 0, set(), []
+    hists: dict = {k: {} for k in _HIST_KEYS}
+    procs, modes, probes, stale = 0, set(), [], 0
     for d in dirs:
         try:
             names = sorted(os.listdir(d))
@@ -215,18 +239,39 @@ def read_status(dirs: list[str]) -> dict:
                 continue
             if not doc.get("patched"):
                 continue                     # inert/probe processes
+            if fresh_within is not None and \
+                    time.time() - float(doc.get("ts", 0)) > fresh_within:
+                stale += 1
+                continue
             procs += 1
             modes.add(doc.get("config", {}).get("mode"))
             if doc.get("probe"):
                 probes.append(doc["probe"].get("node_type"))
+            st = doc.get("stats", {})
             for k in _STAT_KEYS:
-                agg[k] += int(doc.get("stats", {}).get(k, 0))
-    return {"processes": procs, "modes": sorted(m for m in modes if m),
-            "node_types": sorted(set(probes)), **agg}
+                agg[k] += int(st.get(k, 0) or 0)
+            for hk in _HIST_KEYS:
+                for bucket, count in (st.get(hk) or {}).items():
+                    hists[hk][bucket] = hists[hk].get(bucket, 0) + int(count)
+    return {"processes": procs, "stale_files_ignored": stale,
+            "modes": sorted(m for m in modes if m),
+            "node_types": sorted(set(probes)), **agg, **hists}
+
+
+def _hist_delta(before: dict, after: dict) -> dict:
+    out = {}
+    for k in set(after) | set(before):
+        v = int(after.get(k, 0)) - int(before.get(k, 0))
+        if v:
+            out[k] = v
+    return dict(sorted(out.items(),
+                       key=lambda kv: int(kv[0].rstrip("+"))))
 
 
 def status_delta(before: dict, after: dict) -> dict:
     d = {k: after.get(k, 0) - before.get(k, 0) for k in _STAT_KEYS}
+    for hk in _HIST_KEYS:
+        d[hk] = _hist_delta(before.get(hk, {}), after.get(hk, {}))
     decisions = d["admitted"] + d["denied"]
     d["decisions"] = decisions
     d["denial_rate"] = round(d["denied"] / decisions, 4) if decisions else None
@@ -235,6 +280,12 @@ def status_delta(before: dict, after: dict) -> dict:
                               if toks else None)
     d["processes_before"] = before.get("processes")
     d["processes_after"] = after.get("processes")
+    under = d.get("decisions_under_pressure", 0)
+    if under:
+        # the number that matters: of decisions made WHILE scarce, how many
+        # were admitted on merit rather than waved through by relaxation?
+        d["admitted_under_pressure"] = under - d["denied"]
+        d["denial_rate_under_pressure"] = round(d["denied"] / under, 4)
     return d
 
 
@@ -297,6 +348,12 @@ def main() -> None:
     ap.add_argument("--label", default="run")
     ap.add_argument("--out", default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--clear-status", action="store_true",
+                    help="delete existing status files first (recommended "
+                         "between phases; they survive pod restarts)")
+    ap.add_argument("--fresh-within", type=float, default=3600,
+                    help="ignore status files older than N seconds (dead "
+                         "ranks from a previous pod generation)")
     ap.add_argument("--host-tokens", type=int, default=4_380_000,
                     help="host (L2) capacity in tokens PER RANK; from the "
                          "server log: max_total_num_tokens * hicache-ratio")
@@ -340,7 +397,10 @@ def main() -> None:
                   "decline; denial rate will be ~0.")
         return
 
-    before = read_status(args.status_dir) if args.status_dir else {}
+    if args.clear_status and args.status_dir:
+        print(f"cleared {clear_status(args.status_dir)} stale status files")
+    before = (read_status(args.status_dir, args.fresh_within)
+              if args.status_dir else {})
     m_before = fetch_metrics(args.url)
     if before:
         print(f"\nngkv status before: {before}")
@@ -388,11 +448,21 @@ def main() -> None:
         summary["first_errors"] = [r.get("error") for r in fail[:3]]
 
     if args.status_dir:
-        after = read_status(args.status_dir)
+        after = read_status(args.status_dir, args.fresh_within)
         summary["ngkv_before"] = before
         summary["ngkv_after"] = after
         summary["ngkv_delta"] = status_delta(before, after)
-        print(f"\nngkv delta: {summary['ngkv_delta']}")
+        dd = summary["ngkv_delta"]
+        print("\nngkv delta:")
+        for k in ("decisions", "admitted", "denied", "relaxed",
+                  "decisions_under_pressure", "admitted_under_pressure",
+                  "denial_rate_under_pressure", "denial_rate",
+                  "token_denial_rate", "surveyed"):
+            if k in dd:
+                print(f"  {k}: {dd[k]}")
+        for hk in _HIST_KEYS:
+            if dd.get(hk):
+                print(f"  {hk}: {dd[hk]}")
     m_after = fetch_metrics(args.url)
     if m_before or m_after:
         summary["metrics_before"] = m_before

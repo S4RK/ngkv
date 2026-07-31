@@ -121,11 +121,48 @@ class L2Stats:
     free_frac_min: Optional[float] = None
     free_frac_max: Optional[float] = None
     decisions_under_pressure: int = 0   # free < relax_above
+    # Signal survey: distributions of candidate necessity signals AT the
+    # decision point. Recorded unconditionally (including when relaxation
+    # short-circuits the decision) because the question "is this signal
+    # informative here?" must not be answerable only when gating is on.
+    # Measured on K3: node.hit_count is pinned at write_through_threshold
+    # by construction — _inc_hit_count triggers write_backup the moment
+    # the count crosses it — so it carries no information at admission
+    # time. Parent hit_count and depth accumulate history and may.
+    hit_count_hist: dict = dataclasses.field(default_factory=dict)
+    parent_hits_hist: dict = dataclasses.field(default_factory=dict)
+    depth_hist: dict = dataclasses.field(default_factory=dict)
+    keylen_hist: dict = dataclasses.field(default_factory=dict)
+    surveyed: int = 0
 
     @property
     def denial_rate(self) -> float:
         n = self.admitted + self.denied
         return self.denied / n if n else 0.0
+
+    @staticmethod
+    def _bump(hist: dict, value: int, cap: int = 64) -> None:
+        k = str(min(int(value), cap)) + ("+" if value > cap else "")
+        hist[k] = hist.get(k, 0) + 1
+
+    def survey(self, node: Any) -> None:
+        """Sample candidate signals at the decision point (1 in N calls)."""
+        self.surveyed += 1
+        self._bump(self.hit_count_hist, int(getattr(node, "hit_count", -1)))
+        self._bump(self.keylen_hist,
+                   len(getattr(node, "key", ()) or ()) // 1000)  # k-tokens
+        parent, depth = getattr(node, "parent", None), 0
+        while parent is not None and depth < 128:
+            depth += 1
+            nxt = getattr(parent, "parent", None)
+            if nxt is None:
+                break
+            parent = nxt
+        self._bump(self.depth_hist, depth)
+        p = getattr(node, "parent", None)
+        if p is not None:
+            self._bump(self.parent_hits_hist,
+                       int(getattr(p, "hit_count", -1)))
 
     def note_free(self, free: Optional[float], relax_above: float) -> None:
         if free is None:
@@ -201,6 +238,7 @@ class L2Policy:
                                    # all; 0 disables relaxation (always gate)
     gate_writeback: bool = False   # also gate the evict-time write_back path
     log_every: int = 200
+    survey_every: int = 10     # sample 1-in-N decisions for the signal survey
     status_dir: str = "/tmp/ngkv-l2"   # per-process JSON counters
     targets: Optional[list] = None     # modules to patch; None -> default
 
@@ -280,6 +318,13 @@ class L2Policy:
             self._probe(cache, node)
         free = self.free_fraction(cache)
         self.stats.note_free(free, self.relax_above)
+        # survey BEFORE any short-circuit: relaxation must not hide the
+        # signal distribution, or "no data" looks like "no signal".
+        if self.survey_every and self._decisions % self.survey_every == 0:
+            try:
+                self.stats.survey(node)
+            except Exception:
+                pass
         if free is None:
             if not self._warned_pressure:
                 self._warned_pressure = True
