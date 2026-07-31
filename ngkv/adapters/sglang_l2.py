@@ -89,6 +89,17 @@ def _emit(msg: str, level: int = logging.WARNING) -> None:
         pass
 
 TARGET_MODULE = "sglang.srt.mem_cache.hiradix_cache"
+
+# A build ships several radix-cache implementations and the one in use
+# depends on the model: hybrid KDA/Mamba models (Kimi K3) use
+# hi_mamba_radix_cache, dense models use hiradix_cache, and
+# unified_radix_cache covers the unified-pool path. Arming a module that
+# is never imported costs nothing, so all known ones are armed by default.
+DEFAULT_TARGETS = [
+    "sglang.srt.mem_cache.hiradix_cache",
+    "sglang.srt.mem_cache.hi_mamba_radix_cache",
+    "sglang.srt.mem_cache.unified_radix_cache",
+]
 _PATCH_MARK = "_ngkv_l2_patched"
 
 
@@ -110,6 +121,7 @@ class L2Stats:
 
 
 _STATUS_FAILED = set()
+_POLICY_SEQ = 0
 
 
 def _status_path(policy: "L2Policy") -> Optional[str]:
@@ -117,8 +129,9 @@ def _status_path(policy: "L2Policy") -> Optional[str]:
         return None
     try:
         os.makedirs(policy.status_dir, exist_ok=True)
-        return os.path.join(policy.status_dir,
-                            f"{socket.gethostname()}-{os.getpid()}.json")
+        return os.path.join(
+            policy.status_dir,
+            f"{socket.gethostname()}-{os.getpid()}-{policy.uid}.json")
     except Exception as exc:
         if policy.status_dir not in _STATUS_FAILED:
             _STATUS_FAILED.add(policy.status_dir)
@@ -139,6 +152,7 @@ def dump_status(policy: "L2Policy") -> None:
         "patched": policy.patched,
         "config": {f.name: getattr(policy, f.name)
                    for f in dataclasses.fields(policy)},
+        "policy_uid": policy.uid,
         "stats": dataclasses.asdict(policy.stats),
         "denial_rate": policy.stats.denial_rate,
     }
@@ -166,8 +180,16 @@ class L2Policy:
     gate_writeback: bool = False   # also gate the evict-time write_back path
     log_every: int = 200
     status_dir: str = "/tmp/ngkv-l2"   # per-process JSON counters
+    targets: Optional[list] = None     # modules to patch; None -> default
 
     def __post_init__(self) -> None:
+        if not self.targets:
+            self.targets = list(DEFAULT_TARGETS)
+        elif isinstance(self.targets, str):
+            self.targets = [self.targets]
+        global _POLICY_SEQ
+        _POLICY_SEQ += 1
+        self.uid = _POLICY_SEQ      # distinct file per policy in a process
         self.patched: list = []
         if self.mode not in ("observe", "gate"):
             raise ValueError(f"mode must be observe|gate, got {self.mode!r}")
@@ -266,11 +288,13 @@ def patch_module(module: Any, policy: L2Policy) -> list[str]:
     Returns the names patched. Refuses (and logs ERROR) on signature drift.
     """
     patched: list[str] = []
+    already: list[str] = []
     for name, obj in vars(module).items():
         if not inspect.isclass(obj) or "write_backup" not in obj.__dict__:
             continue
         orig = obj.__dict__["write_backup"]
         if getattr(orig, _PATCH_MARK, False):
+            already.append(name)
             continue
         try:
             params = list(inspect.signature(orig).parameters)
@@ -292,6 +316,13 @@ def patch_module(module: Any, policy: L2Policy) -> list[str]:
               f"gate_writeback={policy.gate_writeback}) on: "
               + ", ".join(patched))
         dump_status(policy)
+    elif already:
+        # another policy instance in this process got there first (e.g.
+        # sitecustomize armed it, then install() was called again). The
+        # earlier policy owns the counters; do NOT overwrite its status.
+        _emit(f"already patched by an earlier policy instance: "
+              f"{', '.join(already)} — this instance is inert",
+              logging.INFO)
     else:
         _emit(f"no write_backup found in "
               f"{getattr(module, '__name__', module)} — NOT active",
@@ -331,24 +362,34 @@ class _PostImportPatcher(importlib.abc.MetaPathFinder):
 
 
 def install(policy: Optional[L2Policy] = None,
-            target: str = TARGET_MODULE) -> Optional[L2Policy]:
-    """Arm L2 gating. Safe to call before or after SGLang is imported."""
+            target: Optional[str] = None) -> Optional[L2Policy]:
+    """Arm L2 gating. Safe to call before or after SGLang is imported.
+
+    Patches every module in ``policy.targets``. Multiple targets matter
+    because the radix-cache class depends on the model: hybrid (KDA/Mamba)
+    models use a different implementation from the dense path, and a build
+    may ship both. Arming a module that is never imported costs nothing.
+    """
     policy = policy or policy_from_env()
     if policy is None:
         return None
-    mod = sys.modules.get(target)
-    if mod is not None:  # already imported — patch in place
-        patch_module(mod, policy)
-    else:
-        sys.meta_path.insert(0, _PostImportPatcher(target, policy))
-        _emit(f"armed pid={os.getpid()} for {target} (mode={policy.mode})")
+    targets = [target] if target else list(policy.targets)
+    for tgt in targets:
+        mod = sys.modules.get(tgt)
+        if mod is not None:  # already imported — patch in place
+            patch_module(mod, policy)
+        else:
+            sys.meta_path.insert(0, _PostImportPatcher(tgt, policy))
+    _emit(f"armed pid={os.getpid()} for {', '.join(targets)} "
+          f"(mode={policy.mode})")
 
     # Worker processes may be forked AFTER the parent imported the module,
     # in which case the child inherits an unpatched module and no import
     # event ever fires. Re-run installation in every forked child.
     if not getattr(install, "_fork_hooked", False):
         try:
-            os.register_at_fork(after_in_child=lambda: install(target=target))
+            os.register_at_fork(
+                after_in_child=lambda: install(policy=policy))
             install._fork_hooked = True  # type: ignore[attr-defined]
         except Exception:
             pass

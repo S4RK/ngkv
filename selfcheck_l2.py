@@ -30,19 +30,22 @@ try:
 except Exception as exc:
     print(f"  writable: NO -> {exc!r}")
 
-l2.install(pol)
-import sglang.srt.mem_cache.hiradix_cache as h
+import sglang.srt.mem_cache.hiradix_cache as h   # sitecustomize patches here
 fn = h.HiRadixCache.__dict__.get("write_backup")
-print(f"HiRadixCache patched={getattr(fn, '_ngkv_l2_patched', False)}")
-l2.dump_status(pol)
+patched = getattr(fn, "_ngkv_l2_patched", False)
+print(f"HiRadixCache patched={patched}"
+      f"{'' if patched else '  <-- sitecustomize did NOT run in this process'}")
 
 for d in {pol.status_dir, "/tmp/ngkv-l2"}:
     try:
         files = sorted(os.listdir(d))
     except Exception as exc:
         print(f"{d}: {exc!r}"); continue
-    print(f"{d}: {len(files)} file(s)")
-    for f in files[:12]:
+    mine = f"-{os.getpid()}-"
+    print(f"{d}: {len(files)} file(s) "
+          f"({sum(mine not in f for f in files)} from other processes "
+          f"= server ranks)")
+    for f in files[:16]:
         try:
             doc = json.load(open(os.path.join(d, f)))
             print(f"  {f}: pid={doc['pid']} patched={doc['patched']} "
