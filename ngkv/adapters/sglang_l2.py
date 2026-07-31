@@ -109,6 +109,9 @@ class L2Stats:
         return self.denied / n if n else 0.0
 
 
+_STATUS_FAILED = set()
+
+
 def _status_path(policy: "L2Policy") -> Optional[str]:
     if not policy.status_dir:
         return None
@@ -116,7 +119,12 @@ def _status_path(policy: "L2Policy") -> Optional[str]:
         os.makedirs(policy.status_dir, exist_ok=True)
         return os.path.join(policy.status_dir,
                             f"{socket.gethostname()}-{os.getpid()}.json")
-    except Exception:
+    except Exception as exc:
+        if policy.status_dir not in _STATUS_FAILED:
+            _STATUS_FAILED.add(policy.status_dir)
+            _emit(f"cannot create status_dir {policy.status_dir!r}: {exc!r} "
+                  f"— counters will only appear in this log",
+                  logging.ERROR)
         return None
 
 
@@ -139,8 +147,11 @@ def dump_status(policy: "L2Policy") -> None:
         with open(tmp, "w") as fh:
             json.dump(payload, fh, indent=2)
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as exc:
+        if path not in _STATUS_FAILED:
+            _STATUS_FAILED.add(path)
+            _emit(f"cannot write status file {path!r}: {exc!r} — counters "
+                  f"will only appear in this log", logging.ERROR)
 
 
 @dataclasses.dataclass
@@ -370,9 +381,12 @@ def diagnose(target: str = TARGET_MODULE) -> None:
     # scan the whole mem_cache package: a fork may define it elsewhere
     try:
         import sglang.srt.mem_cache as mc
-        root = os.path.dirname(mc.__file__)
-        print(f"scanning {root} for 'def write_backup':")
-        for dirpath, _dirs, files in os.walk(root):
+        # namespace packages have __file__ = None; __path__ always works
+        roots = [os.path.dirname(mc.__file__)] if getattr(mc, "__file__", None) \
+            else list(getattr(mc, "__path__", []))
+        print(f"scanning {roots} for 'def write_backup':")
+        for dirpath, _dirs, files in [(d, n, f) for r in roots
+                                      for d, n, f in os.walk(r)]:
             for f in files:
                 if not f.endswith(".py"):
                     continue
@@ -382,7 +396,7 @@ def diagnose(target: str = TARGET_MODULE) -> None:
                 except Exception:
                     continue
                 if "def write_backup" in src:
-                    rel = os.path.relpath(p, root)
+                    rel = os.path.relpath(p, roots[0])
                     for line in src.splitlines():
                         if "def write_backup" in line:
                             print(f"  {rel}: {line.strip()}")
