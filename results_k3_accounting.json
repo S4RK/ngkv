@@ -1,0 +1,115 @@
+[
+  {
+    "config": "model_configs/kimi_linear_48b_config.json",
+    "model_type": "kimi_linear",
+    "layers_total": 27,
+    "layers_kda": 20,
+    "layers_mla": 7,
+    "mla_layer_indices_0idx": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      26
+    ],
+    "mla_latent_dim_per_token_per_layer": 576,
+    "gateable_kv_elems_per_token": 4032,
+    "gateable_kv_per_token_bytes": {
+      "bf16": 8064.0,
+      "fp8": 4032.0,
+      "fp4": 2016.0
+    },
+    "gateable_kv_per_request_GB": {
+      "8,192 tok": {
+        "bf16": 0.062,
+        "fp8": 0.031,
+        "fp4": 0.015
+      },
+      "32,768 tok": {
+        "bf16": 0.246,
+        "fp8": 0.123,
+        "fp4": 0.062
+      },
+      "131,072 tok": {
+        "bf16": 0.984,
+        "fp8": 0.492,
+        "fp4": 0.246
+      },
+      "1,048,576 tok": {
+        "bf16": 7.875,
+        "fp8": 3.938,
+        "fp4": 1.969
+      }
+    },
+    "kda_state_per_seq_MB_bf16": 21.41,
+    "kda_state_note": "constant in context length; conv tail counted as 3*H*hd*(k-1) upper bound; this is the object snapshot admission (Rung K3-4) gates, NOT part of the NG-KV token-gating surface",
+    "granularity_note": "MLA latent is shared across heads: gating unit = (token, layer); per-head gating does not exist on this surface"
+  },
+  {
+    "config": "model_configs/kimi_k3_config.json",
+    "model_type": "kimi_k3",
+    "layers_total": 93,
+    "layers_kda": 69,
+    "layers_mla": 24,
+    "mla_layer_indices_0idx": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47,
+      51,
+      55,
+      59,
+      63,
+      67,
+      71,
+      75,
+      79,
+      83,
+      87,
+      91,
+      92
+    ],
+    "mla_latent_dim_per_token_per_layer": 576,
+    "gateable_kv_elems_per_token": 13824,
+    "gateable_kv_per_token_bytes": {
+      "bf16": 27648.0,
+      "fp8": 13824.0,
+      "fp4": 6912.0
+    },
+    "gateable_kv_per_request_GB": {
+      "8,192 tok": {
+        "bf16": 0.211,
+        "fp8": 0.105,
+        "fp4": 0.053
+      },
+      "32,768 tok": {
+        "bf16": 0.844,
+        "fp8": 0.422,
+        "fp4": 0.211
+      },
+      "131,072 tok": {
+        "bf16": 3.375,
+        "fp8": 1.688,
+        "fp4": 0.844
+      },
+      "1,048,576 tok": {
+        "bf16": 27.0,
+        "fp8": 13.5,
+        "fp4": 6.75
+      }
+    },
+    "kda_state_per_seq_MB_bf16": 221.55,
+    "kda_state_note": "constant in context length; conv tail counted as 3*H*hd*(k-1) upper bound; this is the object snapshot admission (Rung K3-4) gates, NOT part of the NG-KV token-gating surface",
+    "granularity_note": "MLA latent is shared across heads: gating unit = (token, layer); per-head gating does not exist on this surface"
+  }
+]

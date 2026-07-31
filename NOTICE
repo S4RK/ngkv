@@ -1,0 +1,9 @@
+NG-KV — Necessity-Gated KV Cache Management
+Copyright 2026 Syni (open research initiative)
+
+Grounded in SIVAM TR-01, "Necessity-Gated Activation Modulation" (Syni).
+SIVAM and NG-KV are Apache 2.0.
+
+vendor/kimi_ref/: modeling_kimi.py and configuration_kimi.py vendored
+from moonshotai/Kimi-Linear-48B-A3B-Instruct (Moonshot AI, MIT license)
+for smoke-testing the capture seam only; not part of NG-KV.
