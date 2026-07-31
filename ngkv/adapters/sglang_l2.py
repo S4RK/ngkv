@@ -113,11 +113,32 @@ class L2Stats:
     admitted_tokens: int = 0
     denied_tokens: int = 0
     relaxed: int = 0  # admitted because memory wasn't scarce
+    # host-pool free fraction as the policy actually measured it — the
+    # quantity that decides whether gating engages at all. Cumulative
+    # token counts are a poor proxy once host eviction starts recycling
+    # the same tokens, so record the real signal.
+    free_frac_last: Optional[float] = None
+    free_frac_min: Optional[float] = None
+    free_frac_max: Optional[float] = None
+    decisions_under_pressure: int = 0   # free < relax_above
 
     @property
     def denial_rate(self) -> float:
         n = self.admitted + self.denied
         return self.denied / n if n else 0.0
+
+    def note_free(self, free: Optional[float], relax_above: float) -> None:
+        if free is None:
+            return
+        self.free_frac_last = round(free, 4)
+        self.free_frac_min = (free if self.free_frac_min is None
+                              else min(self.free_frac_min, free))
+        self.free_frac_max = (free if self.free_frac_max is None
+                              else max(self.free_frac_max, free))
+        self.free_frac_min = round(self.free_frac_min, 4)
+        self.free_frac_max = round(self.free_frac_max, 4)
+        if not (relax_above > 0.0 and free >= relax_above):
+            self.decisions_under_pressure += 1
 
 
 _STATUS_FAILED = set()
@@ -258,6 +279,7 @@ class L2Policy:
         if not self._probed:
             self._probe(cache, node)
         free = self.free_fraction(cache)
+        self.stats.note_free(free, self.relax_above)
         if free is None:
             if not self._warned_pressure:
                 self._warned_pressure = True
@@ -286,7 +308,10 @@ class L2Policy:
             _emit(f"[{self.mode}] {s.admitted} admitted / {s.denied} denied "
                   f"({100 * s.denial_rate:.1f}% denied, {s.denied_tokens}/"
                   f"{s.admitted_tokens + s.denied_tokens} tokens), "
-                  f"{s.relaxed} relaxed by free memory")
+                  f"{s.relaxed} relaxed by free memory; host free now "
+                  f"{s.free_frac_last} (min {s.free_frac_min}, "
+                  f"threshold {self.relax_above}), "
+                  f"{s.decisions_under_pressure} decisions under pressure")
             dump_status(self)
 
 
