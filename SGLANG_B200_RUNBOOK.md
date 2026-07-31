@@ -24,21 +24,21 @@ Known constraints, stated plainly:
 ## Phase 0 — install (once, shared FS)
 
 ```bash
-cd /mnt/kvbm-cache
-unzip -o ngkv-v0.8.zip           # -> /mnt/kvbm-cache/ngkv
+cd /mnt/local-nvme
+unzip -o ngkv-v0.8.zip           # -> /mnt/local-nvme/ngkv
 ```
 
 Inside the SGLang container/venv on each serving node:
 
 ```bash
-pip install -e /mnt/kvbm-cache/ngkv
+pip install -e /mnt/local-nvme/ngkv
 python - <<'EOF'
 from ngkv.adapters.sglang_backend import NGKVFilteredStorage
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 assert issubclass(NGKVFilteredStorage, HiCacheStorage)
 print("ngkv adapter importable, subclass check OK")
 EOF
-pip install -q pytest && python -m pytest /mnt/kvbm-cache/ngkv/tests/test_sglang_backend.py -q
+pip install -q pytest && python -m pytest /mnt/local-nvme/ngkv/tests/test_sglang_backend.py -q
 ```
 
 If the subclass assert fails, the SGLang build predates the
@@ -51,8 +51,8 @@ Add to the server flags in your `serve_kimi_k3_sglang.sbatch` (or the
 single-node launch):
 
 ```bash
-mkdir -p /mnt/kvbm-cache/hicache-l3
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/mnt/kvbm-cache/hicache-l3
+mkdir -p /mnt/local-nvme/hicache-l3
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/mnt/local-nvme/hicache-l3
 
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
@@ -68,7 +68,7 @@ record the three baseline numbers:
 
 ```bash
 # 1. L3 bytes written
-du -sb /mnt/kvbm-cache/hicache-l3
+du -sb /mnt/local-nvme/hicache-l3
 # 2. cache hit rate + TTFT from the metrics endpoint
 curl -s localhost:30000/metrics | grep -iE "cache_hit|ttft|prefix"
 # 3. keep the loadgen report (TTFT p50/p99, throughput)
@@ -154,7 +154,7 @@ deliverable.
 
 Remove the four hicache flags (or set `--hicache-storage-backend
 file`). Denied pages were never stored, so there is no state to clean
-beyond `rm -rf /mnt/kvbm-cache/hicache-l3` if you want the disk back.
+beyond `rm -rf /mnt/local-nvme/hicache-l3` if you want the disk back.
 
 ## What this does NOT yet do
 

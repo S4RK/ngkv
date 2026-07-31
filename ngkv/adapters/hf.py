@@ -38,6 +38,11 @@ try:  # torch is optional; core package works without it.
 except ImportError:  # pragma: no cover
     torch = None
 
+# @torch.no_grad() evaluates at class-definition time, i.e. at import —
+# use a shim so a torch-less environment can still import the package
+# (the class itself refuses to construct without torch, as before).
+_no_grad = torch.no_grad if torch is not None else (lambda: (lambda f: f))
+
 
 class NGKVController:
     def __init__(
@@ -66,7 +71,7 @@ class NGKVController:
         return torch.stack(rows).mean(dim=0).float().cpu().numpy()
 
     # ------------------------------------------------------------------
-    @torch.no_grad()
+    @_no_grad()
     def generate(self, input_ids, max_new_tokens: int = 256, **kw):
         past = None
         generated = input_ids

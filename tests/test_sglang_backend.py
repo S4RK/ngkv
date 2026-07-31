@@ -140,3 +140,89 @@ def test_getattr_delegation():
 
     s = NGKVFilteredStorage(Inner(), admit_frac=1.0)
     assert s.clear() == "cleared"
+
+
+# ---- v2 pool interface (hybrid controller path, discovered live on K3) ----
+
+import dataclasses as _dc
+import numpy as _np
+
+
+@_dc.dataclass
+class _FakeTransfer:
+    name: str
+    keys: list
+    host_indices: object = None
+    hit_policy: str = "all_pages"
+
+
+class _FakeIndices:
+    """Mimics a torch tensor: numel() + slicing."""
+    def __init__(self, n): self.a = _np.arange(n)
+    def numel(self): return len(self.a)
+    def __getitem__(self, sl):
+        out = _FakeIndices(0); out.a = self.a[sl]; return out
+
+
+class _V2Inner:
+    def __init__(self):
+        self.registered = {}
+        self.set_calls = []
+    def register_mem_pool_host(self, p): self.registered["v1"] = p
+    def register_mem_host_pool_v2(self, p, name): self.registered[name] = p
+    def batch_exists_v2(self, keys, *a, **k): return ("exists", len(keys))
+    def batch_get_v2(self, transfers, *a, **k): return {"kv": [True] * 3}
+    def batch_set_v2(self, transfers, *a, **k):
+        self.set_calls.append(transfers)
+        return {str(t.name): [True] * len(t.keys or []) for t in transfers}
+    def batch_set(self, *a, **k): return True
+
+
+def test_v2_registration_and_reads_reach_inner():
+    from ngkv.adapters.sglang_backend import NGKVFilteredStorage
+    inner = _V2Inner()
+    s = NGKVFilteredStorage(inner, admit_frac=1.0)
+    s.register_mem_pool_host("HOSTPOOL")
+    s.register_mem_host_pool_v2("KVPOOL", "kv")
+    assert inner.registered == {"v1": "HOSTPOOL", "kv": "KVPOOL"}
+    assert s.batch_exists_v2(["a", "b"]) == ("exists", 2)
+    assert s.batch_get_v2([]) == {"kv": [True] * 3}
+
+
+def test_v2_set_passthrough_at_admit_all():
+    from ngkv.adapters.sglang_backend import NGKVFilteredStorage, AdmitAll
+    inner = _V2Inner()
+    s = NGKVFilteredStorage(inner, AdmitAll(), admit_frac=0.3)
+    tr = [_FakeTransfer("kv", ["k0", "k1"], _FakeIndices(4))]
+    out = s.batch_set_v2(tr)
+    assert out == {"kv": [True, True]}
+    assert inner.set_calls[0] is tr           # untouched passthrough
+
+
+def test_v2_prefix_cut_truncates_kv_and_indices():
+    from ngkv.adapters.sglang_backend import (NGKVFilteredStorage,
+                                              PositionScorer)
+    inner = _V2Inner()
+    s = NGKVFilteredStorage(inner, PositionScorer(), admit_frac=0.5)
+    kv = _FakeTransfer("kv", [f"k{i}" for i in range(4)], _FakeIndices(8))
+    out = s.batch_set_v2([kv])
+    sent = inner.set_calls[0][0]
+    assert sent.keys == ["k0", "k1"]          # ceil(0.5*4) prefix
+    assert sent.host_indices.numel() == 4     # 2 pages * page_size 2
+    assert out["kv"] == [True, True, False, False]
+    assert s.stats.admitted == 2 and s.stats.denied == 2
+
+
+def test_v2_trailing_pool_dropped_when_kv_tail_cut():
+    from ngkv.adapters.sglang_backend import (NGKVFilteredStorage,
+                                              PositionScorer)
+    inner = _V2Inner()
+    s = NGKVFilteredStorage(inner, PositionScorer(), admit_frac=0.5)
+    kv = _FakeTransfer("kv", [f"k{i}" for i in range(4)], _FakeIndices(4))
+    mamba = _FakeTransfer("mamba", ["m0"], _FakeIndices(1),
+                          hit_policy="trailing_pages")
+    out = s.batch_set_v2([kv, mamba])
+    sent_names = [str(t.name) for t in inner.set_calls[0]]
+    assert sent_names == ["kv"]               # mamba write dropped entirely
+    assert out["mamba"] == [False]
+    assert out["kv"] == [True, True, False, False]

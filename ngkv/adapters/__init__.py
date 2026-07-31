@@ -17,4 +17,7 @@ score a block as the max (not mean) necessity of its tokens, so one
 vital token protects its block — the conservative choice.
 """
 
-from . import hf  # noqa: F401
+try:  # optional: needs torch; absence must not break the package
+    from . import hf  # noqa: F401
+except Exception:  # pragma: no cover
+    hf = None  # type: ignore[assignment]

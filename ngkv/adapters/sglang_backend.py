@@ -268,14 +268,7 @@ class NGKVFilteredStorage(HiCacheStorage):
                   values: Optional[Sequence[Any]] = None, *args: Any,
                   **kwargs: Any) -> bool:
         mask = self._admit_mask(keys)
-        self._flushes += 1
-        if self.log_every and self._flushes % self.log_every == 0:
-            import logging
-            logging.getLogger("ngkv.sglang").info(
-                "ngkv admission: %d admitted / %d denied (denial rate "
-                "%.1f%%) over %d flushes", self.stats.admitted,
-                self.stats.denied, 100 * self.stats.denial_rate,
-                self._flushes)
+        self._maybe_log()
         adm = [i for i in range(len(keys)) if mask[i]]
         if not adm:
             return True
@@ -307,8 +300,108 @@ class NGKVFilteredStorage(HiCacheStorage):
             for a in args)
         return self.inner.batch_set_v1(sub_keys, *sub_args, **kwargs)
 
-    # ---- everything else passes through (delete, clear, registration
-    # hooks, stats — and any surface added after this adapter was cut) ----
+    # ---- v2 pool interface (hybrid models: KDA/Mamba state pools) ----
+    #
+    # The base class DEFINES these (as NotImplementedError stubs or
+    # concrete no-ops), so __getattr__ never fires for them — every one
+    # must be forwarded explicitly or the wrapper shadows the inner
+    # backend. Discovered live on Kimi K3: the hybrid cache controller
+    # drives storage exclusively through the v2 interface, with KV pages
+    # in pool "kv" and KDA state snapshots in pool "mamba"
+    # (TRAILING_PAGES policy).
+    #
+    # Registration MUST reach the inner backend — the base-class default
+    # would silently record host pools on the wrapper and the inner
+    # backend's page I/O would then fail or read nothing.
+
+    def register_mem_pool_host(self, mem_pool_host: Any) -> Any:
+        return self.inner.register_mem_pool_host(mem_pool_host)
+
+    def register_mem_host_pool_v2(self, host_pool: Any,
+                                  host_pool_name: Any) -> Any:
+        return self.inner.register_mem_host_pool_v2(host_pool, host_pool_name)
+
+    def batch_exists_v2(self, keys: Sequence[str], *args: Any,
+                        **kwargs: Any) -> Any:
+        return self.inner.batch_exists_v2(keys, *args, **kwargs)
+
+    def batch_get_v2(self, transfers: Any, *args: Any, **kwargs: Any) -> Any:
+        return self.inner.batch_get_v2(transfers, *args, **kwargs)
+
+    def _prefix_cut(self, n: int) -> int:
+        """Admitted KV-prefix length for an n-page flush.
+
+        v2 semantics are longest-prefix with co-presence (exists_v2
+        returns the MIN usable prefix across pools), so admission is a
+        prefix cut, not a score-ranked subset: denying page i makes
+        every later page unreachable regardless of its score. AdmitAll
+        admits everything; other scorers currently reduce to the byte
+        budget (scorer-informed cut placement needs the reuse-necessity
+        feed — future work, stated plainly).
+        """
+        if n == 0:
+            return 0
+        if isinstance(self.scorer, AdmitAll) or self.admit_frac >= 1.0:
+            return n
+        return max(1, int(np.ceil(self.admit_frac * n)))
+
+    def batch_set_v2(self, transfers: Any, *args: Any, **kwargs: Any) -> Any:
+        kv = next((t for t in transfers
+                   if str(getattr(t, "name", "")) == "kv"), None)
+        n = len(kv.keys) if (kv is not None and kv.keys) else 0
+        k = self._prefix_cut(n)
+        self.stats.admitted += k
+        self.stats.denied += n - k
+        self._maybe_log()
+        if kv is None or k >= n:
+            return self.inner.batch_set_v2(transfers, *args, **kwargs)
+
+        gated, dropped = [], {}
+        for t in transfers:
+            keys = t.keys or []
+            policy = str(getattr(t, "hit_policy", "all_pages"))
+            if policy == "trailing_pages" and str(t.name) != "kv":
+                # trailing pools (mamba/swa state) cover the LAST pages
+                # of the KV prefix; cutting the KV tail invalidates that
+                # coverage, so drop the pool's write entirely. Deny is
+                # safe: worst case is a prefill recompute on resume.
+                dropped[str(t.name)] = [False] * len(keys)
+                continue
+            kk = min(k, len(keys))
+            hi = t.host_indices
+            if hi is not None and len(keys) > 0 and kk < len(keys):
+                ps = hi.numel() // len(keys)  # page stride (validated
+                #      by inner: numel == len(keys) * page_size)
+                hi = hi[: kk * ps]
+            gated.append(dataclasses.replace(
+                t, keys=keys[:kk], host_indices=hi))
+            dropped.setdefault(str(t.name), []).extend(
+                [False] * (len(keys) - kk))
+        results = self.inner.batch_set_v2(gated, *args, **kwargs)
+        for name, tail in dropped.items():
+            results[name] = list(results.get(name, [])) + tail
+        return results
+
+    def _maybe_log(self) -> None:
+        self._flushes += 1
+        if self.log_every and self._flushes % self.log_every == 0:
+            import logging
+            logging.getLogger("ngkv.sglang").info(
+                "ngkv admission: %d admitted / %d denied (denial rate "
+                "%.1f%%) over %d flushes", self.stats.admitted,
+                self.stats.denied, 100 * self.stats.denial_rate,
+                self._flushes)
+
+    # ---- base-class concretes that must reach the inner backend ----
+
+    def clear(self, *args: Any, **kwargs: Any) -> Any:
+        return self.inner.clear(*args, **kwargs)
+
+    def get_stats(self, *args: Any, **kwargs: Any) -> Any:
+        return self.inner.get_stats(*args, **kwargs)
+
+    # ---- everything else passes through (delete, registration
+    # hooks — and any surface added after this adapter was cut) ----
 
     def __getattr__(self, name: str) -> Any:
         if name == "inner":  # not yet set (mid-__init__) — avoid recursion

@@ -10,3 +10,6 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 hf = ["torch>=2.1", "transformers>=4.44"]
 sim = ["matplotlib>=3.7"]
+
+[tool.setuptools]
+packages = ["ngkv", "ngkv.adapters"]
