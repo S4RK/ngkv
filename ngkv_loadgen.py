@@ -118,6 +118,21 @@ class Workload:
             tail = make_text(rng, args.tail_tokens)
             self.plan.append(
                 (idx, f"{body}\n\nQuestion: {tail}\nAnswer:"))
+        # Request class is the client-side cache-effectiveness instrument:
+        # a "hot_repeat" request re-sends a prefix already sent earlier in
+        # this run, so its prefill SHOULD be skipped if the cache kept it.
+        # Comparing TTFT across classes measures the cache's value without
+        # needing any server metric.
+        seen: set = set()
+        self.classes: list[str] = []
+        for idx, _ in self.plan:
+            if idx < 0:
+                self.classes.append("oneshot")
+            elif idx in seen:
+                self.classes.append("hot_repeat")
+            else:
+                seen.add(idx)
+                self.classes.append("hot_first")
 
     def describe(self) -> dict:
         counts: dict[int, int] = {}
@@ -141,6 +156,8 @@ class Workload:
             "top_prefix_share": round(
                 max(shared.values()) / len(self.plan), 3) if shared else 0.0,
             "approx_distinct_prompt_tokens": distinct,
+            "class_counts": {c: self.classes.count(c)
+                             for c in ("hot_first", "hot_repeat", "oneshot")},
         }
 
 
@@ -418,9 +435,11 @@ def main() -> None:
     results, done, lock = [], [0], threading.Lock()
     t_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futs = [pool.submit(one_request, args, p) for _, p in wl.plan]
+        futs = {pool.submit(one_request, args, p): wl.classes[i]
+                for i, (_, p) in enumerate(wl.plan)}
         for f in as_completed(futs):
             r = f.result()
+            r["class"] = futs[f]
             results.append(r)
             with lock:
                 done[0] += 1
@@ -447,6 +466,24 @@ def main() -> None:
     if fail:
         summary["first_errors"] = [r.get("error") for r in fail[:3]]
 
+    # Per-class TTFT: the cache-effectiveness measurement.
+    by_class = {}
+    for cls in ("hot_first", "hot_repeat", "oneshot"):
+        t = [r["ttft"] for r in ok
+             if r.get("class") == cls and r.get("ttft") is not None]
+        if t:
+            by_class[cls] = {"n": len(t), "ttft_p50": pct(t, 0.50),
+                             "ttft_p90": pct(t, 0.90),
+                             "ttft_mean": round(statistics.fmean(t), 4)}
+    summary["by_class"] = by_class
+    hr, of = by_class.get("hot_repeat"), by_class.get("oneshot")
+    if hr and of and hr["ttft_p50"]:
+        # >1 means re-sent prefixes were served faster than fresh ones,
+        # i.e. the cache is doing work. This is the headline number to
+        # compare across policy arms at FIXED host memory.
+        summary["cache_advantage_p50"] = round(
+            of["ttft_p50"] / hr["ttft_p50"], 3)
+
     if args.status_dir:
         after = read_status(args.status_dir, args.fresh_within)
         summary["ngkv_before"] = before
@@ -472,6 +509,14 @@ def main() -> None:
     for k in ("ok", "failed", "wall_seconds", "throughput_rps", "ttft_p50",
               "ttft_p99", "e2e_p50", "e2e_p99"):
         print(f"  {k}: {summary[k]}")
+    if summary.get("by_class"):
+        print("  TTFT by request class (cache effectiveness):")
+        for cls, v in summary["by_class"].items():
+            print(f"    {cls:11s} n={v['n']:4d} p50={v['ttft_p50']}s "
+                  f"p90={v['ttft_p90']}s")
+    if summary.get("cache_advantage_p50"):
+        print(f"  cache_advantage_p50: {summary['cache_advantage_p50']}x "
+              f"(oneshot TTFT / hot_repeat TTFT; 1.0 = cache doing nothing)")
 
     out = args.out or f"loadgen_{args.label}.json"
     json.dump(summary, open(out, "w"), indent=2, default=str)
