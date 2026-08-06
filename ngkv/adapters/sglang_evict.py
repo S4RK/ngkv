@@ -193,11 +193,21 @@ def _register_choice(server_args_mod: Any) -> None:
 
 
 def _wrap_factory(evict_mod: Any, weights: EvictWeights) -> None:
+    """Rebind ``get_eviction_strategy`` in ``evict_mod``'s namespace.
+
+    Works whether the module DEFINES the function or merely IMPORTED it
+    (``from x import get_eviction_strategy`` binds a module-global that
+    call sites resolve at call time), so the defining module's location
+    — which moves between forks — never matters. Applied to every
+    radix-cache module we arm; missing on some is fine as long as it
+    lands where the caches construct their strategy.
+    """
     orig = getattr(evict_mod, "get_eviction_strategy", None)
     if orig is None or getattr(orig, "_ngkv_wrapped", False):
         if orig is None:
-            _emit("evict: no get_eviction_strategy in evict_policy — "
-                  "cannot register 'ngkv'; check SGLang version")
+            _emit(f"evict: no get_eviction_strategy in "
+                  f"{getattr(evict_mod, '__name__', evict_mod)} — skipping "
+                  f"(harmless if it lands in a radix-cache module)")
         return
 
     def get_eviction_strategy(name: str, *a: Any, **k: Any):
@@ -221,10 +231,19 @@ def install_evict(weights: Optional[EvictWeights] = None) -> Optional[EvictWeigh
     if weights is None:
         return None
 
+    wrap = lambda m: _wrap_factory(m, weights)  # noqa: E731
     for target, hook in (
             ("sglang.srt.server_args", _register_choice),
-            ("sglang.srt.mem_cache.evict_policy",
-             lambda m: _wrap_factory(m, weights))):
+            # wrap the name wherever it is bound: the defining module AND
+            # every radix-cache module that imported it. Call sites like
+            # ``self.eviction_strategy = get_eviction_strategy(name)``
+            # resolve the module global at call time, so rebinding in the
+            # cache module is sufficient even when the definer moved.
+            ("sglang.srt.mem_cache.evict_policy", wrap),
+            ("sglang.srt.mem_cache.radix_cache", wrap),
+            ("sglang.srt.mem_cache.hiradix_cache", wrap),
+            ("sglang.srt.mem_cache.hi_mamba_radix_cache", wrap),
+            ("sglang.srt.mem_cache.unified_radix_cache", wrap)):
         mod = sys.modules.get(target)
         if mod is not None:
             hook(mod)
