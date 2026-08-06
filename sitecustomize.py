@@ -20,3 +20,12 @@ if os.environ.get("NGKV_L2"):
     except Exception as exc:  # pragma: no cover
         print(f"[ngkv-l2] install failed, continuing unpatched: {exc!r}",
               file=sys.stderr)
+
+if os.environ.get("NGKV_EVICT") is not None:
+    try:
+        from ngkv.adapters.sglang_evict import install_evict
+
+        install_evict()
+    except Exception as exc:  # pragma: no cover
+        print(f"[ngkv-evict] install failed, continuing unpatched: {exc!r}",
+              file=sys.stderr)

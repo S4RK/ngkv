@@ -230,3 +230,24 @@ This patches library internals at runtime and is version-fragile by
 construction. It refuses to patch (loud ERROR, never a silent no-op) if
 `write_backup`'s signature drifts. Re-check the ACTIVE log line on every
 SGLang upgrade.
+
+---
+# Addendum 2: eviction arms (from observe to acting)
+
+Baseline arms (flag-only, no NG-KV code in the decision path):
+```yaml
+  - --radix-eviction-policy
+  - lfu        # arm C; then slru for arm D
+```
+Arm A: remove --enable-hierarchical-cache. Arm B: current config.
+
+Arm E (NG-KV eviction), two stages:
+1. SHADOW — behaviour identical to the named baseline, scores logged:
+   env NGKV_EVICT='{"shadow_of":"slru"}' + args --radix-eviction-policy ngkv
+2. LIVE — weights from fit_evict_weights.py:
+   env NGKV_EVICT='{"w_hits":...,"w_parent":...,...}' + same flag
+
+Boot check: `evict: registered 'ngkv'` then `evict ACTIVE pid=...` in logs.
+Every arm: same seeded loadgen, --clear-status, distinct --label; compare
+cache_advantage_p50, TTFT p50/p99, thrash ratio at fixed host memory.
+Admission gate v2 (parent-chain signal) waits for the survey verdict.
